@@ -1,0 +1,119 @@
+export enum Severity {
+  PASS = "PASS",
+  WARNING = "WARNING",
+  BLOCKER = "BLOCKER"
+}
+
+export enum Platform {
+  LINKEDIN = "LinkedIn",
+  META = "Meta",
+  GOOGLE = "Google",
+  TIKTOK = "TikTok",
+  X = "X",
+  REDDIT = "Reddit",
+  DV360 = "DV360"
+}
+
+export type Creative = {
+  filename: string;
+  platform: Platform;
+  width: number;
+  height: number;
+  text_density: "low" | "medium" | "high";
+  campaign_objective: "awareness" | "demand_gen";
+  campaign_name?: string;
+  placement_tag?: string;
+
+  status: Severity;
+  issues: string[];
+  fixes: string[];
+};
+
+export function createCreative(
+  filename: string,
+  platform: Platform,
+  width: number,
+  height: number,
+  text_density: "low" | "medium" | "high",
+  campaign_objective: "awareness" | "demand_gen",
+  campaign_name?: string,
+  placement_tag?: string
+): Creative {
+  return {
+    filename,
+    platform,
+    width,
+    height,
+    text_density,
+    campaign_objective,
+    campaign_name,
+    placement_tag,
+    status: Severity.PASS,
+    issues: [],
+    fixes: []
+  };
+}
+
+// Simple pre-flight validator (hackathon demo version)
+export class Trafficker {
+  creative: Creative;
+
+  constructor(c: Creative) {
+    this.creative = structuredClone(c);
+  }
+
+  validate(): Creative {
+    const c = this.creative;
+    const issues: string[] = [];
+    const fixes: string[] = [];
+
+    // Placement tag required for DV360/Google (demo rule)
+    if ((c.platform === Platform.DV360 || c.platform === Platform.GOOGLE) && !c.placement_tag) {
+      issues.push("Missing required tag for trafficking (placement tag).");
+    }
+
+    // Aspect ratio sanity checks (demo)
+    const ratio = c.width / c.height;
+    const approx = (a: number, b: number) => Math.abs(a - b) < 0.02;
+    const ok =
+      approx(ratio, 1) ||
+      approx(ratio, 16 / 9) ||
+      approx(ratio, 9 / 16) ||
+      approx(ratio, 1.91);
+
+    if (!ok) {
+      issues.push(`Aspect Ratio not supported (${c.width}x${c.height}).`);
+    }
+
+    // Text density warnings
+    if (c.text_density === "high") {
+      issues.push("Text density is high (may reduce reach or increase CPM).");
+    }
+
+    // Campaign name guidance
+    if (!c.campaign_name || c.campaign_name.trim().length === 0) {
+      issues.push("Missing campaign name (optional, but recommended for reporting).");
+    }
+
+    // Auto-fix: normalize filename
+    const orig = c.filename;
+    const safe = orig.replace(/\s+/g, "_").replace(/__+/g, "_");
+    if (safe !== orig) {
+      c.filename = safe;
+      fixes.push(`Auto-fixed filename: "${orig}" → "${safe}"`);
+    }
+
+    // Status logic
+    const isBlocker = issues.some(i => i.includes("Aspect Ratio") || i.includes("Missing required tag"));
+    const isWarning = issues.length > 0 && !isBlocker;
+
+    c.issues = issues;
+    c.fixes = fixes;
+    c.status = isBlocker ? Severity.BLOCKER : isWarning ? Severity.WARNING : Severity.PASS;
+
+    // If we auto-fixed and only warnings exist, keep WARNING to prompt review
+    if (fixes.length > 0 && c.status === Severity.PASS) c.status = Severity.WARNING;
+
+    return c;
+  }
+}

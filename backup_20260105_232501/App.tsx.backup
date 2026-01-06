@@ -1,0 +1,512 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import "./App.css";
+import { createCreative, Trafficker, Platform, Severity, type Creative } from "./Trafficker";
+import { digestInputs, type DigestResult } from "./ingest/Digest";
+
+interface Placement {
+  id: string;
+  tag: string;
+  dimensions: string;
+  width: number;
+  height: number;
+  raw: any;
+}
+
+type IngestedCreative = {
+  id: string;
+  name: string;
+  kind: "image" | "video";
+  width?: number;
+  height?: number;
+  duration?: number;
+  source: "standalone" | "zip" | "url";
+};
+
+function creativesFromDigest(d: DigestResult | null): IngestedCreative[] {
+  if (!d) return [];
+  return d.items
+    .filter((it) => it.type === "creative_image" || it.type === "creative_video")
+    .map((it) => ({
+      id: it.id,
+      name: it.name,
+      kind: it.type === "creative_video" ? "video" : "image",
+      width: it.meta?.width,
+      height: it.meta?.height,
+      duration: it.meta?.duration,
+      source: it.source === "mojo" ? "standalone" : it.source,
+    }));
+}
+
+function placementsFromDigest(d: DigestResult | null): Placement[] {
+  if (!d) return [];
+  const out: Placement[] = [];
+  let idx = 0;
+
+  for (const sheet of d.sheets) {
+    for (const row of sheet.rows) {
+      const tag = row?.[4];
+      const dims = row?.[10];
+
+      if (dims && typeof dims === "string" && dims.includes("x") && tag) {
+        const [w, h] = dims.split("x").map(Number);
+        if (!isNaN(w) && !isNaN(h)) {
+          out.push({
+            id: `${sheet.name}_ROW_${idx++}`,
+            tag: String(tag),
+            dimensions: dims,
+            width: w,
+            height: h,
+            raw: row,
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+export default function App() {
+  const [formData, setFormData] = useState({
+    filename: "creative_v1.jpg",
+    width: 1080,
+    height: 1080,
+    text_density: "low" as "low" | "medium" | "high",
+    campaign_objective: "awareness" as "awareness" | "demand_gen",
+    campaign_name: "",
+  });
+
+  const [reports, setReports] = useState<Record<string, Creative> | null>(null);
+  const [selectedPlatforms, setSelectedPlatforms] = useState<Platform[]>([
+    Platform.META,
+    Platform.GOOGLE,
+    Platform.TIKTOK,
+  ]);
+  const [viewPlatform, setViewPlatform] = useState<Platform>(Platform.LINKEDIN);
+
+  useEffect(() => {
+    if (selectedPlatforms.length === 0) return;
+    if (!selectedPlatforms.includes(viewPlatform)) setViewPlatform(selectedPlatforms[0]);
+  }, [selectedPlatforms, viewPlatform]);
+
+  // Unified ingest
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [digest, setDigest] = useState<DigestResult | null>(null);
+  const [ingesting, setIngesting] = useState(false);
+  const [ingestMsg, setIngestMsg] = useState("");
+  const [uploadStats, setUploadStats] = useState("");
+  const [gsheetUrl, setGsheetUrl] = useState("");
+
+  const creatives = useMemo(() => creativesFromDigest(digest), [digest]);
+  const [selectedCreativeId, setSelectedCreativeId] = useState("");
+  const placements = useMemo(() => placementsFromDigest(digest), [digest]);
+  const [selectedPlacementId, setSelectedPlacementId] = useState("");
+
+  const selectedPlacement = useMemo(
+    () => placements.find((p) => p.id === selectedPlacementId),
+    [placements, selectedPlacementId]
+  );
+
+  const primaryPlatform: Platform = viewPlatform ?? (selectedPlatforms[0] ?? Platform.LINKEDIN);
+  const primaryReport: Creative | null = reports ? reports[primaryPlatform] ?? null : null;
+
+  // Magic moment snapshot
+  const [lastBefore, setLastBefore] = useState<{ filename: string; width: number; height: number } | null>(null);
+  const [magicApplied, setMagicApplied] = useState(false);
+
+  const runDigest = async (files: FileList | File[], gsheet?: string) => {
+    setIngesting(true);
+    setIngestMsg("Digesting uploads…");
+    setUploadStats("");
+
+    try {
+      const result = await digestInputs(files, gsheet?.trim() ? gsheet.trim() : undefined);
+      setDigest(result);
+
+      const foundCreatives = creativesFromDigest(result).length;
+      const foundSheets = result.items.filter((i) => i.type === "tag_sheet").length;
+
+      setIngestMsg(`Found ${foundCreatives} creative(s), ${foundSheets} spreadsheet(s). Auto-filled specs.`);
+
+      const pl = placementsFromDigest(result);
+      if (pl.length > 0) setUploadStats(`✅ Loaded ${pl.length} valid placements from uploaded sheet(s).`);
+      else if (foundSheets > 0) setUploadStats(`✅ Spreadsheet detected (no placement rows matched Column E/K heuristic).`);
+      else setUploadStats(`✅ Upload digested.`);
+
+      // Auto-select first creative
+      const firstCreative = creativesFromDigest(result)[0];
+      if (firstCreative) {
+        setSelectedCreativeId(firstCreative.id);
+        setFormData((prev) => ({
+          ...prev,
+          filename: firstCreative.name,
+          width: firstCreative.width ?? prev.width,
+          height: firstCreative.height ?? prev.height,
+        }));
+      }
+      setSelectedPlacementId("");
+    } catch (e: any) {
+      console.error(e);
+      setIngestMsg(`Error digesting uploads: ${e?.message ?? String(e)}`);
+      setUploadStats("❌ Error reading uploads");
+    } finally {
+      setIngesting(false);
+    }
+  };
+
+  const handleSelectPlacement = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const id = e.target.value;
+    setSelectedPlacementId(id);
+    const p = placements.find((x) => x.id === id);
+    if (p) setFormData((prev) => ({ ...prev, width: p.width, height: p.height }));
+  };
+
+  const handleRun = () => {
+    setLastBefore({ filename: formData.filename, width: Number(formData.width), height: Number(formData.height) });
+
+    const newReports: Record<string, Creative> = {};
+    selectedPlatforms.forEach((platform) => {
+      const creative = createCreative(
+        formData.filename,
+        platform,
+        Number(formData.width),
+        Number(formData.height),
+        formData.text_density,
+        formData.campaign_objective,
+        formData.campaign_name || undefined,
+        selectedPlacement?.tag
+      );
+      const trafficker = new Trafficker(creative);
+      newReports[platform] = trafficker.validate();
+    });
+    setReports(newReports);
+  };
+
+  const applyMagicFixes = () => {
+    if (!primaryReport || !lastBefore) return;
+    setFormData((prev) => ({
+      ...prev,
+      filename: primaryReport.filename,
+      width: primaryReport.width,
+      height: primaryReport.height,
+    }));
+    setMagicApplied(true);
+    setTimeout(() => {
+      setMagicApplied(false);
+      handleRun();
+    }, 350);
+  };
+
+  const getStatusIcon = (status: Severity) => (status === Severity.PASS ? "✅" : status === Severity.WARNING ? "⚠️" : "⛔");
+
+  const getNextAction = (status: Severity) =>
+    status === Severity.BLOCKER ? "Fix blockers before trafficking" : status === Severity.WARNING ? "Review auto-fixes and approve" : "Ready to traffic";
+
+  const getBusinessContext = (issue: string): string => {
+    if (issue.includes("Aspect Ratio")) return "Why this matters: Wrong dimensions cause rejection or bad cropping, hurting performance.";
+    if (issue.includes("Text density")) return "Why this matters: High text density can reduce reach and increase CPMs.";
+    if (issue.includes("campaign name")) return "Why this matters: Filenames drive trafficking + reporting consistency; mistakes break attribution.";
+    if (issue.includes("required tag")) return "Why this matters: Missing placement tags prevents correct routing to inventory.";
+    return "Why this matters: Adherence to specs ensures platform acceptance and optimal delivery.";
+  };
+
+  return (
+    <div className="container">
+      <h1>Creative Pre-Flight Checker ✈️</h1>
+
+      <div className="grid">
+        <div className="card" style={{ gridColumn: "1 / -1", marginBottom: 20 }}>
+          <h2>📦 Drop anything (zip, creatives, Excel/CSV, video)</h2>
+
+          <div
+            style={{
+              border: `2px dashed ${dragOver ? "#6b7cff" : "#aac"}`,
+              background: dragOver ? "#f0f3ff" : "#eef",
+              padding: 12,
+              borderRadius: 8,
+            }}
+            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragOver(false);
+              if (e.dataTransfer.files && e.dataTransfer.files.length > 0) void runDigest(e.dataTransfer.files, gsheetUrl);
+            }}
+          >
+            <div className="form-group" style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <button className="secondary-btn small" onClick={() => fileInputRef.current?.click()} disabled={ingesting}>
+                {ingesting ? "Digesting…" : "Choose files"}
+              </button>
+
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept=".zip,image/*,video/*,.xlsx,.xls,.csv"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  const files = e.target.files;
+                  if (files && files.length > 0) void runDigest(files, gsheetUrl);
+                }}
+              />
+
+              <span style={{ fontWeight: 800, color: uploadStats.includes("❌") ? "red" : "green" }}>{uploadStats}</span>
+              <span style={{ color: "#444" }}>{ingestMsg}</span>
+            </div>
+
+            <div className="form-group" style={{ marginTop: 10 }}>
+              <label style={{ fontWeight: 800 }}>Google Sheet URL (optional)</label>
+              <input
+                type="text"
+                value={gsheetUrl}
+                onChange={(e) => setGsheetUrl(e.target.value)}
+                placeholder="Paste a public Google Sheet URL (optional)"
+              />
+              <small style={{ display: "block", marginTop: 5, color: "gray" }}>
+                Public sheets can be fetched as CSV; private sheets will show an error.
+              </small>
+            </div>
+
+            {placements.length > 0 && (
+              <div style={{ marginTop: 10 }}>
+                <select value={selectedPlacementId} onChange={handleSelectPlacement}>
+                  <option value="">-- Select a Placement to Auto-Fill Rules --</option>
+                  {placements.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.dimensions} - {p.tag.substring(0, 50)}...
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="card">
+          <h2>Creative Specs</h2>
+
+          <div className="form-group" style={{ background: "#eef", padding: 10, borderRadius: 6, border: "1px dashed #aac" }}>
+            <label>🎨 Creatives (detected from uploads)</label>
+            <select
+              value={selectedCreativeId}
+              onChange={(e) => {
+                const id = e.target.value;
+                setSelectedCreativeId(id);
+                const c = creatives.find((x) => x.id === id);
+                if (c) {
+                  setFormData((prev) => ({
+                    ...prev,
+                    filename: c.name,
+                    width: c.width ?? prev.width,
+                    height: c.height ?? prev.height,
+                  }));
+                }
+              }}
+            >
+              <option value="">-- Select a Creative --</option>
+              {creatives.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                  {c.width && c.height ? ` (${c.width}x${c.height})` : ""}
+                  {c.kind === "video" && c.duration ? ` • ${c.duration.toFixed(1)}s` : ""}
+                </option>
+              ))}
+            </select>
+            <small style={{ display: "block", marginTop: 6, color: "gray" }}>
+              Drop a zip/JPG/video/Excel/CSV above — Mojo extracts creatives + specs automatically.
+            </small>
+          </div>
+
+          <div className="form-group">
+            <label>Destination Platforms</label>
+            <div style={{ display: "flex", gap: 10, marginBottom: 8 }}>
+              <button className="secondary-btn small" onClick={() => setSelectedPlatforms(Object.values(Platform))}>Select All</button>
+              <button className="secondary-btn small" onClick={() => setSelectedPlatforms([])}>Clear All</button>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 8, maxHeight: 240, overflowY: "auto", border: "1px solid #ddd", padding: 10, borderRadius: 8 }}>
+              {Object.values(Platform).map((p) => (
+                <label key={p} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.9em" }}>
+                  <input
+                    type="checkbox"
+                    checked={selectedPlatforms.includes(p)}
+                    onChange={(e) => {
+                      if (e.target.checked) setSelectedPlatforms((prev) => [...prev, p]);
+                      else setSelectedPlatforms((prev) => prev.filter((x) => x !== p));
+                    }}
+                  />
+                  {p}
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div className="form-group">
+            <label>Filename</label>
+            <input type="text" value={formData.filename} onChange={(e) => setFormData({ ...formData, filename: e.target.value })} />
+          </div>
+
+          <div className="form-group">
+            <label>Campaign Name (Optional)</label>
+            <input type="text" value={formData.campaign_name} onChange={(e) => setFormData({ ...formData, campaign_name: e.target.value })} />
+          </div>
+
+          <div className="row">
+            <div className="form-group">
+              <label>Width</label>
+              <input type="number" value={formData.width} onChange={(e) => setFormData({ ...formData, width: Number(e.target.value) })} />
+            </div>
+            <div className="form-group">
+              <label>Height</label>
+              <input type="number" value={formData.height} onChange={(e) => setFormData({ ...formData, height: Number(e.target.value) })} />
+            </div>
+          </div>
+
+          <div className="form-group">
+            <label>Text Density</label>
+            <select value={formData.text_density} onChange={(e) => setFormData({ ...formData, text_density: e.target.value as any })}>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+            </select>
+          </div>
+
+          <div className="form-group">
+            <label>Objective</label>
+            <select value={formData.campaign_objective} onChange={(e) => setFormData({ ...formData, campaign_objective: e.target.value as any })}>
+              <option value="awareness">Awareness</option>
+              <option value="demand_gen">Demand Gen</option>
+            </select>
+          </div>
+
+          <button onClick={handleRun} className="primary-btn">Run Pre-Flight Check</button>
+
+          <div className="form-group" style={{ marginTop: 10 }}>
+            <label>View Platform Report</label>
+            <select value={viewPlatform} onChange={(e) => setViewPlatform(e.target.value as Platform)}>
+              {selectedPlatforms.map((p) => <option key={p} value={p}>{p}</option>)}
+            </select>
+            <div style={{ fontSize: "0.8em", color: "#666", marginTop: 4 }}>Run once, then flip between platform views.</div>
+          </div>
+        </div>
+
+        <div className="results-area">
+          {primaryReport ? (
+            <>
+              <div className="card">
+                <h2>Mojo Pre-Flight Summary</h2>
+                <p style={{ marginTop: -10, color: "#666", fontSize: "0.9em", marginBottom: 20 }}>
+                  Validates creative readiness before spend — flags risk, auto-fixes issues, and explains next steps.
+                </p>
+
+                <div className="summary-grid">
+                  <div className="stat">
+                    <span className="label">Overall Status</span>
+                    <span className={`value ${primaryReport.status}`}>{primaryReport.status} {getStatusIcon(primaryReport.status)}</span>
+                  </div>
+                  <div className="stat">
+                    <span className="label">Issues</span>
+                    <span className="value">{primaryReport.issues.length}</span>
+                  </div>
+                  <div className="stat">
+                    <span className="label">Auto-Fixed</span>
+                    <span className="value">{primaryReport.fixes.length}</span>
+                  </div>
+                  <div className="stat full-width">
+                    <span className="label">Top Risk</span>
+                    <span className="value">{primaryReport.issues[0] || "None"}</span>
+                  </div>
+                  <div className="stat full-width" style={{ background: "#f9fafb" }}>
+                    <span className="label">Recommended Action</span>
+                    <span className="value">{getNextAction(primaryReport.status)}</span>
+                  </div>
+                </div>
+              </div>
+
+              {primaryReport && lastBefore && primaryReport.fixes.length > 0 && (
+                <div className={`card magic-card ${magicApplied ? "magic-applied" : ""}`}>
+                  <div>
+                    <h2 style={{ margin: 0 }}>✨ Magic Fix</h2>
+                    <div className="magic-sub">One click to apply Mojo’s safe auto-fixes and instantly improve readiness.</div>
+                  </div>
+
+                  <div className="before-after">
+                    <div className="pane">
+                      <div className="pane-title">Before</div>
+                      <div className="kv"><span>File</span><code>{lastBefore.filename}</code></div>
+                      <div className="kv"><span>Size</span><code>{lastBefore.width}×{lastBefore.height}</code></div>
+                    </div>
+
+                    <div className="arrow">→</div>
+
+                    <div className="pane">
+                      <div className="pane-title">After</div>
+                      <div className="kv"><span>File</span><code>{primaryReport.filename}</code></div>
+                      <div className="kv"><span>Size</span><code>{primaryReport.width}×{primaryReport.height}</code></div>
+                    </div>
+                  </div>
+
+                  <div className="magic-actions">
+                    <button className="magic-btn" onClick={applyMagicFixes}>✨ Apply Mojo Fixes</button>
+                    <div className="magic-notes">
+                      {primaryReport.fixes.length} auto-fix{primaryReport.fixes.length === 1 ? "" : "es"} ready to apply
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="card">
+                <h2>Detailed Trafficking Report</h2>
+                <div><strong>File:</strong> <code>{primaryReport.filename}</code></div>
+
+                {primaryReport.issues.length > 0 && (
+                  <div className="report-section">
+                    <h3>⚠️ Issues Found (Requires Human Review)</h3>
+                    <ul>
+                      {primaryReport.issues.map((issue, i) => (
+                        <li key={i}>
+                          <strong>{issue}</strong>
+                          <div style={{ fontSize: "0.85em", color: "#555", marginTop: 2, fontStyle: "italic" }}>
+                            {getBusinessContext(issue)}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {primaryReport.fixes.length > 0 && (
+                  <div className="report-section" style={{ borderTop: "2px solid #e0e0e0", marginTop: 20 }}>
+                    <h3>✅ Auto-Fixed by Mojo</h3>
+                    <ul style={{ color: "#16a34a", fontWeight: 700 }}>
+                      {primaryReport.fixes.map((fix, i) => <li key={i}>{fix}</li>)}
+                    </ul>
+                  </div>
+                )}
+
+                {primaryReport.status === Severity.PASS && <div className="success-msg">✅ Ready for flight!</div>}
+              </div>
+            </>
+          ) : (
+            <div className="card" style={{ opacity: 0.75 }}>
+              <h2>Mojo Pre-Flight Summary</h2>
+              <p style={{ marginTop: -10, color: "#666", fontSize: "0.9em", marginBottom: 20 }}>
+                Validates creative readiness before spend — flags risk, auto-fixes issues, and explains next steps.
+              </p>
+              <div className="summary-grid">
+                <div className="stat">
+                  <span className="label">Overall Status</span>
+                  <span className="value" style={{ color: "#999" }}>WAITING… ⏳</span>
+                </div>
+                <div className="stat"><span className="label">Issues</span><span className="value">--</span></div>
+                <div className="stat"><span className="label">Auto-Fixed</span><span className="value">--</span></div>
+                <div className="stat full-width"><span className="label">Top Risk</span><span className="value" style={{ color: "#999", fontStyle: "italic" }}>Upload asset to check</span></div>
+                <div className="stat full-width" style={{ background: "#f5f5f5" }}><span className="label">Recommended Action</span><span className="value">run pre-flight check</span></div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
